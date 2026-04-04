@@ -1,0 +1,18 @@
+Metadata-Version: 2.4
+Name: sageattn3_simplified
+Version: 1.0.0
+Summary: FP4FlashAttention (Simplified/Documented Version)
+Classifier: Programming Language :: Python :: 3
+Classifier: License :: OSI Approved :: Apache Software License
+Classifier: Operating System :: Unix
+Requires-Python: >=3.8
+Description-Content-Type: text/markdown
+Requires-Dist: torch
+Requires-Dist: einops
+Requires-Dist: packaging
+Requires-Dist: ninja
+Dynamic: classifier
+Dynamic: description-content-type
+Dynamic: requires-dist
+Dynamic: requires-python
+Dynamic: summary
