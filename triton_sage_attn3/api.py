@@ -134,7 +134,6 @@ def sageattn3_triton(
     if quant == "none":
         out_pad = sage_attn3_fwd(
             q_pre, k_pre, v_pre,
-            delta_s=delta_s,
             softmax_scale=sm_scale,
             is_causal=is_causal,
             per_block_mean=per_block_mean,
@@ -149,7 +148,6 @@ def sageattn3_triton(
         out_pad = sage_attn3_fwd_fp8(
             q_fp8, k_fp8, v_fp8,
             q_scale, k_scale,
-            delta_s=delta_s,
             softmax_scale=sm_scale,
             is_causal=is_causal,
             per_block_mean=per_block_mean,
@@ -164,7 +162,6 @@ def sageattn3_triton(
         out_pad = sage_attn3_fwd_fp4(
             q_packed, k_T_packed, v_fp4,
             q_scales, k_scales,
-            delta_s=delta_s,
             softmax_scale=sm_scale,
             is_causal=is_causal,
             per_block_mean=per_block_mean,

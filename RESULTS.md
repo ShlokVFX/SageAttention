@@ -186,11 +186,7 @@ B=1, H=16, non-causal, BF16 input. TFLOPS = 4·B·H·L²·D / (ms × 10⁹).
 - [ ] Video comparison:
   ```bash
   cd SageAttention/example
-  pip install accelerate
-  pip install transformers
-  pip install opencv-python
-  pip install imageio
-  pip install imageio--ffmpeg
+  pip install diffusers accelerate transformers opencv-python imageio imageio-ffmpeg
   python sage3_video_compare.py \
     --backends sdpa triton \
     --prompt "Cat Dancing on the beach" \

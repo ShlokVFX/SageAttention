@@ -42,7 +42,8 @@ import torch
 import torch.nn.functional as F
 from diffusers import WanPipeline
 from diffusers.utils import export_to_video
-
+import os
+os.environ["TRITON_ALLOW_NON_CONSTEXPR_GLOBALS"] = "1"
 # ── Path setup ────────────────────────────────────────────────────────────────
 _HERE    = os.path.dirname(os.path.abspath(__file__))
 _SA_ROOT = os.path.dirname(_HERE)
@@ -247,8 +248,10 @@ def main():
     os.makedirs(out_dir, exist_ok=True)
 
     # ── Load backends ─────────────────────────────────────────────────────────
+    ordered = sorted(args.backends, key=lambda x: 0 if x == "triton" else 1)
+
     backend_fns = {}
-    for name in args.backends:
+    for name in ordered:
         try:
             backend_fns[name] = BACKEND_FACTORIES[name]()
             print(f"[OK]   backend '{name}' loaded")
