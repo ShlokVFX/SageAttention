@@ -62,8 +62,8 @@ from typing import Literal, Optional
 import torch
 
 from .preprocessing import preprocess_qkv
-from .attention import sage_attn3_fwd, sage_attn3_fwd_fp8
-from .quantize import quantise_qkv_fp8
+from .attention import sage_attn3_fwd, sage_attn3_fwd_fp8, sage_attn3_fwd_fp4
+from .quantize import quantise_qkv_fp8, quantise_qkv_fp4
 
 
 # ---------------------------------------------------------------------------
@@ -77,7 +77,7 @@ def sageattn3_triton(
     attn_mask:      Optional[torch.Tensor] = None,
     is_causal:      bool                   = False,
     sm_scale:       Optional[float]        = None,
-    quant:          Literal["none", "fp8"] = "none",
+    quant:          Literal["none", "fp8", "fp4"] = "none",
     per_block_mean: bool                   = True,
     group_size:     int                    = 128,
     block_m:        int                    = 128,
@@ -98,7 +98,8 @@ def sageattn3_triton(
         attn_mask:      Not yet supported (pass None).
         is_causal:      Apply causal mask (auto-lower triangular).
         sm_scale:       Softmax scale.  Defaults to 1/√D.
-        quant:          'none' → BF16 kernel;  'fp8' → FP8 kernel (H100+).
+        quant:          'none' → BF16 kernel;  'fp8' → FP8 kernel (H100+);
+                        'fp4' → MXFP4 E2M1 kernel (SM120 Blackwell, ~4× BF16).
         per_block_mean: True  → per-128-token Q mean (recommended).
                         False → global Q mean (slightly faster preprocess).
         group_size:     Smooth-quant group size.  Must equal block_m (128).
@@ -156,8 +157,23 @@ def sageattn3_triton(
             block_n=block_n,
         )
 
+    elif quant == "fp4":
+        q_packed, k_T_packed, v_fp4, q_scales, k_scales = quantise_qkv_fp4(
+            q_pre, k_pre, v_pre
+        )
+        out_pad = sage_attn3_fwd_fp4(
+            q_packed, k_T_packed, v_fp4,
+            q_scales, k_scales,
+            delta_s=delta_s,
+            softmax_scale=sm_scale,
+            is_causal=is_causal,
+            per_block_mean=per_block_mean,
+            block_m=block_m,
+            block_n=block_n,
+        )
+
     else:
-        raise ValueError(f"Unknown quant mode '{quant}'. Choose 'none' or 'fp8'.")
+        raise ValueError(f"Unknown quant mode '{quant}'. Choose 'none', 'fp8', or 'fp4'.")
 
     # ── Strip sequence padding and return ─────────────────────────────────────
     return out_pad[:, :, :orig_L, :].contiguous()

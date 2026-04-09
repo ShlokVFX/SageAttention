@@ -394,6 +394,279 @@ _BF16_CONFIGS = [
 ]
 
 
+# ---------------------------------------------------------------------------
+# MXFP4 attention kernel  (SM120 Blackwell — uses tl.dot_scaled)
+# ---------------------------------------------------------------------------
+#
+# Q and K are pre-quantised to MXFP4 E2M1 format:
+#   Q_packed:   [B, H,   N_q, D//2]  uint8 — packed FP4, 2 per byte
+#   Q_scales:   [B, H,   N_q, D//32] uint8 — E8M0 block scale per 32 elements
+#   K_T_packed: [B, H_k, D//2, N_k]  uint8 — K transposed, packed FP4
+#   K_scales:   [B, H_k, N_k, D//32] uint8 — per-token E8M0 scales
+#
+# The QK^T matmul uses:
+#   tl.dot_scaled(Q_tile [M, D//2], Q_scale_tile [M, D//32], 'e2m1',
+#                 K_T_tile [D//2, N], K_scale_tile [N, D//32], 'e2m1')
+# which maps to:
+#   mma.sync.aligned.m16n8k64.kind::mxf4nvf4.block_scale.ue8m0  (SM120 native)
+#
+# V stays in BF16 / FP16 (same choice as original SageAttention3 CUDA kernel).
+# The PV matmul therefore uses BF16 tensor cores as in the BF16 kernel.
+#
+# Softmax and accumulation are identical to the BF16 kernel (FP32 precision).
+# ---------------------------------------------------------------------------
+
+@triton.jit
+def _fwd_kernel_fp4(
+    # ── FP4 Q tensors ────────────────────────────────────────────────────────
+    QP,         # [B, H,   N_q, D//2]  uint8  packed FP4
+    QS,         # [B, H,   N_q, D//32] uint8  E8M0 scales
+    # ── FP4 K tensors (K is pre-transposed) ──────────────────────────────────
+    KTP,        # [B, H_k, D//2, N_k]  uint8  packed FP4 (transposed)
+    KS,         # [B, H_k, N_k, D//32] uint8  E8M0 scales (per-token)
+    # ── BF16/FP16 V tensor ───────────────────────────────────────────────────
+    V,          # [B, H_k, N_k, D]     BF16/FP16
+    # ── Smooth-quant correction ───────────────────────────────────────────────
+    DeltaS,     # [B, H,   G,  N_k]   FP32  (or dummy)
+    # ── Output ───────────────────────────────────────────────────────────────
+    Out,        # [B, H,   N_q, D]     BF16/FP16
+    # ── Scalar ───────────────────────────────────────────────────────────────
+    softmax_scale,
+    # ── QP strides [B, H, N_q, D//2] ─────────────────────────────────────────
+    stride_qpb, stride_qph, stride_qpn, stride_qpd,
+    # ── QS strides [B, H, N_q, D//32] ───────────────────────────────────────
+    stride_qsb, stride_qsh, stride_qsn, stride_qsd,
+    # ── KTP strides [B, H_k, D//2, N_k] ─────────────────────────────────────
+    stride_ktb, stride_kth, stride_ktd, stride_ktn,
+    # ── KS strides [B, H_k, N_k, D//32] ─────────────────────────────────────
+    stride_ksb, stride_ksh, stride_ksn, stride_ksd,
+    # ── V strides [B, H_k, N_k, D] ───────────────────────────────────────────
+    stride_vb, stride_vh, stride_vn, stride_vd,
+    # ── Out strides [B, H, N_q, D] ───────────────────────────────────────────
+    stride_ob, stride_oh, stride_on, stride_od,
+    # ── DeltaS strides ───────────────────────────────────────────────────────
+    stride_dsb, stride_dsh, stride_dsg, stride_dsn,
+    # ── Dimensions ───────────────────────────────────────────────────────────
+    N_q, N_k, H, H_k,
+    # ── Compile-time constants ────────────────────────────────────────────────
+    HEAD_DIM:       tl.constexpr,   # D (full, not packed)
+    BLOCK_M:        tl.constexpr,
+    BLOCK_N:        tl.constexpr,
+    IS_CAUSAL:      tl.constexpr,
+    HAS_DELTA_S:    tl.constexpr,
+    PER_BLOCK_MEAN: tl.constexpr,
+):
+    """
+    FP4 (MXFP4 E2M1) flash-attention forward kernel for SM120 Blackwell.
+
+    Grid: (ceil(N_q / BLOCK_M),  B * H)
+    """
+    # ── Identify this program ─────────────────────────────────────────────────
+    m_pid  = tl.program_id(0)
+    bh_pid = tl.program_id(1)
+    b_idx  = bh_pid // H
+    h_idx  = bh_pid  % H
+    kv_h_idx = h_idx // (H // H_k)
+
+    m_start  = m_pid * BLOCK_M
+    offs_m   = m_start + tl.arange(0, BLOCK_M)
+    offs_d   = tl.arange(0, HEAD_DIM)
+    offs_dp  = tl.arange(0, HEAD_DIM // 2)   # packed D (uint8)
+    offs_ds  = tl.arange(0, HEAD_DIM // 32)  # scale groups
+
+    # ── Load FP4 Q tile ───────────────────────────────────────────────────────
+    qp_base = b_idx * stride_qpb + h_idx * stride_qph
+    qp_ptrs = QP + qp_base \
+              + offs_m[:, None] * stride_qpn \
+              + offs_dp[None, :] * stride_qpd
+    q_mask  = offs_m[:, None] < N_q
+    q_packed = tl.load(qp_ptrs, mask=q_mask, other=0)   # [BLOCK_M, D//2] uint8
+
+    qs_base = b_idx * stride_qsb + h_idx * stride_qsh
+    qs_ptrs = QS + qs_base \
+              + offs_m[:, None] * stride_qsn \
+              + offs_ds[None, :] * stride_qsd
+    q_scales = tl.load(qs_ptrs, mask=offs_m[:, None] < N_q, other=0)  # [BLOCK_M, D//32] uint8
+
+    # ── Accumulators (same online softmax as BF16 kernel) ─────────────────────
+    acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
+    m_i = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
+    l_i = tl.zeros([BLOCK_M],              dtype=tl.float32)
+
+    # ── Base pointers ─────────────────────────────────────────────────────────
+    kv_base_T = b_idx * stride_ktb + kv_h_idx * stride_kth   # K_T_packed
+    ks_base   = b_idx * stride_ksb + kv_h_idx * stride_ksh   # K_scales
+    vv_base   = b_idx * stride_vb  + kv_h_idx * stride_vh    # V
+
+    g_idx = m_pid if PER_BLOCK_MEAN else 0
+    if HAS_DELTA_S:
+        ds_row_base = b_idx * stride_dsb + h_idx * stride_dsh + g_idx * stride_dsg
+
+    n_blocks_total = tl.cdiv(N_k, BLOCK_N)
+    if IS_CAUSAL:
+        n_block_max = tl.minimum(n_blocks_total, tl.cdiv(m_start + BLOCK_M, BLOCK_N))
+    else:
+        n_block_max = n_blocks_total
+
+    LOG2E: tl.constexpr = 1.4426950408889634
+
+    # ── Main loop over K/V blocks ─────────────────────────────────────────────
+    for n_block in range(n_block_max):
+        n_start = n_block * BLOCK_N
+        offs_n  = n_start + tl.arange(0, BLOCK_N)
+
+        # ── Load K_T_packed: [D//2, BLOCK_N] ─────────────────────────────────
+        # KTP layout: [B, H_k, D//2, N_k]  strides: ..., stride_ktd, stride_ktn=1
+        # This load is memory-coalesced because N_k is the innermost dim (stride=1).
+        ktp_ptrs = KTP + kv_base_T \
+                   + offs_dp[:, None] * stride_ktd \
+                   + offs_n[None, :]  * stride_ktn
+        k_mask   = offs_n[None, :] < N_k
+        k_T_packed = tl.load(ktp_ptrs, mask=k_mask, other=0)  # [D//2, BLOCK_N] uint8
+
+        # ── Load K_scales: [BLOCK_N, D//32] ──────────────────────────────────
+        # KS layout: [B, H_k, N_k, D//32]
+        ks_ptrs  = KS + ks_base \
+                   + offs_n[:, None]  * stride_ksn \
+                   + offs_ds[None, :] * stride_ksd
+        k_scales = tl.load(ks_ptrs, mask=offs_n[:, None] < N_k, other=0)  # [BLOCK_N, D//32] uint8
+
+        # ── FP4 QK^T via tl.dot_scaled → float32 output ──────────────────────
+        # lhs: Q_packed   [BLOCK_M, D//2],  lhs_scale: Q_scales   [BLOCK_M, D//32]
+        # rhs: K_T_packed [D//2, BLOCK_N],  rhs_scale: K_scales   [BLOCK_N, D//32]
+        # tl.dot_scaled internally applies scales and returns dequantised float32.
+        # On SM120: maps to mma.m16n8k64.kind::mxf4nvf4.block_scale.ue8m0
+        qk = tl.dot_scaled(
+            q_packed, q_scales, 'e2m1',
+            k_T_packed, k_scales, 'e2m1',
+            out_dtype=tl.float32,
+        )   # [BLOCK_M, BLOCK_N]  float32, already dequantised
+
+        # ── Smooth-quant delta_s correction ───────────────────────────────────
+        if HAS_DELTA_S:
+            ds_ptrs = DeltaS + ds_row_base + offs_n * stride_dsn
+            ds      = tl.load(ds_ptrs, mask=offs_n < N_k, other=0.0)
+            qk      = qk + ds[None, :]
+
+        # ── Softmax temperature + masking ─────────────────────────────────────
+        qk = qk * softmax_scale
+        qk = tl.where(offs_n[None, :] < N_k, qk, float("-inf"))
+        if IS_CAUSAL:
+            qk = tl.where(offs_m[:, None] >= offs_n[None, :], qk, float("-inf"))
+
+        # ── Online softmax (Flash Attention 2) ────────────────────────────────
+        m_ij  = tl.max(qk, axis=1)
+        m_new = tl.maximum(m_i, m_ij)
+        p     = tl.math.exp2(qk * LOG2E - m_new[:, None] * LOG2E)
+        alpha = tl.math.exp2((m_i - m_new) * LOG2E)
+        l_i   = l_i * alpha + tl.sum(p, axis=1)
+        m_i   = m_new
+
+        # ── Load V (BF16/FP16) and accumulate ────────────────────────────────
+        v_ptrs = V + vv_base \
+                 + offs_n[:, None] * stride_vn \
+                 + offs_d[None, :]  * stride_vd
+        v_mask = offs_n[:, None] < N_k
+        v      = tl.load(v_ptrs, mask=v_mask, other=0.0)  # [BLOCK_N, HEAD_DIM]
+
+        acc = acc * alpha[:, None] \
+              + tl.dot(p.to(v.dtype), v, out_dtype=tl.float32)
+
+    # ── Normalise and write output ─────────────────────────────────────────────
+    safe_l = tl.where(l_i > 0.0, l_i, 1.0)
+    acc    = acc / safe_l[:, None]
+
+    o_base = b_idx * stride_ob + h_idx * stride_oh
+    o_ptrs = Out + o_base \
+             + offs_m[:, None] * stride_on \
+             + offs_d[None, :]  * stride_od
+    tl.store(o_ptrs, acc.to(Out.dtype.element_ty), mask=offs_m[:, None] < N_q)
+
+
+def sage_attn3_fwd_fp4(
+    q_packed:   torch.Tensor,
+    k_T_packed: torch.Tensor,
+    v:          torch.Tensor,
+    q_scales:   torch.Tensor,
+    k_scales:   torch.Tensor,
+    delta_s:    Optional[torch.Tensor] = None,
+    softmax_scale: Optional[float]    = None,
+    is_causal:     bool               = False,
+    per_block_mean: bool              = True,
+    block_m:   int = 128,
+    block_n:   int = 64,
+) -> torch.Tensor:
+    """
+    Launch the MXFP4 SageAttention3 forward pass (SM120 Blackwell).
+
+    Uses tl.dot_scaled with 'e2m1' format which lowers to the native
+    mma.m16n8k64.kind::mxf4nvf4.block_scale instruction on SM120.
+
+    Args:
+        q_packed:   [B, H,   N_q, D//2]  torch.uint8  FP4-packed Q
+        k_T_packed: [B, H_k, D//2, N_k]  torch.uint8  FP4-packed K (transposed)
+        v:          [B, H_k, N_k, D]     BF16/FP16
+        q_scales:   [B, H,   N_q, D//32] torch.uint8  E8M0 scales
+        k_scales:   [B, H_k, N_k, D//32] torch.uint8  E8M0 scales
+        delta_s:    [B, H,   G,   N_k]   FP32 smooth-quant correction (None → skip)
+        softmax_scale: 1/sqrt(D) if None
+        is_causal:  apply causal mask
+        per_block_mean: delta_s group mode
+        block_m, block_n: tile sizes
+
+    Returns:
+        out: [B, H, N_q, D]  same dtype as v
+    """
+    B, H, N_q, D_packed = q_packed.shape
+    D    = D_packed * 2
+    H_k  = k_T_packed.shape[1]
+    N_k  = k_T_packed.shape[3]   # [B, H_k, D//2, N_k]
+
+    assert H % H_k == 0
+    if softmax_scale is None:
+        softmax_scale = D ** -0.5
+
+    has_delta_s = delta_s is not None
+    out = torch.empty(B, H, N_q, D, dtype=v.dtype, device=v.device)
+
+    grid = (triton.cdiv(N_q, block_m), B * H)
+
+    ds_ptr     = delta_s if has_delta_s else q_packed
+    ds_strides = (
+        delta_s.stride(0), delta_s.stride(1),
+        delta_s.stride(2), delta_s.stride(3),
+    ) if has_delta_s else (0, 0, 0, 0)
+
+    _fwd_kernel_fp4[grid](
+        q_packed, q_scales, k_T_packed, k_scales, v, ds_ptr, out,
+        softmax_scale,
+        # QP strides
+        q_packed.stride(0),   q_packed.stride(1),   q_packed.stride(2),   q_packed.stride(3),
+        # QS strides
+        q_scales.stride(0),   q_scales.stride(1),   q_scales.stride(2),   q_scales.stride(3),
+        # KTP strides
+        k_T_packed.stride(0), k_T_packed.stride(1), k_T_packed.stride(2), k_T_packed.stride(3),
+        # KS strides
+        k_scales.stride(0),   k_scales.stride(1),   k_scales.stride(2),   k_scales.stride(3),
+        # V strides
+        v.stride(0),          v.stride(1),           v.stride(2),          v.stride(3),
+        # Out strides
+        out.stride(0),        out.stride(1),          out.stride(2),        out.stride(3),
+        # DeltaS strides
+        *ds_strides,
+        N_q, N_k, H, H_k,
+        HEAD_DIM       = D,
+        BLOCK_M        = block_m,
+        BLOCK_N        = block_n,
+        IS_CAUSAL      = is_causal,
+        HAS_DELTA_S    = has_delta_s,
+        PER_BLOCK_MEAN = per_block_mean,
+        num_warps      = 4,
+        num_stages     = 2,   # 2 > 3 on SM120 for this kernel (measured)
+    )
+    return out
+
+
 def sage_attn3_fwd(
     q:         torch.Tensor,
     k:         torch.Tensor,
