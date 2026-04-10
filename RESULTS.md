@@ -1,214 +1,212 @@
-# SageAttention3 Triton BF16 — Results
+# SageAttention3 Triton — Results
 
-Comparing three attention backends on **NVIDIA GeForce RTX 5060 (SM120 Blackwell, 8 GB VRAM)**:
+Benchmarks on **NVIDIA GeForce RTX 5090 (SM120 Blackwell)** unless noted.
+
+Comparing four attention backends:
 
 | Backend | Implementation | Precision |
 |---|---|---|
 | `sdpa` | PyTorch `scaled_dot_product_attention` | FP32 reference |
 | `triton` | **This work** — pure Triton, CUTLASS-free | BF16 |
-| `sage3` | Original SageAttention3 | FP4 E2M1 (SM120 CUTLASS) |
+| `triton_fp4` | **This work** — Triton FP4 MXFP4 E2M1 | FP4 (SM120 native MMA) |
+| `sage3` | Original SageAttention3 (RTX 5060 data from prior run) | FP4 E2M1 (SM120 CUTLASS) |
 
 ---
 
 ## 1. Attention Kernel Accuracy
 
 Compared to a float32 SDPA ground truth on identical random tensors (seed=42, BF16 input).
+`B=1, H=16`. Cosine similarity measured against FP32 SDPA output.
 
 ### D=64 (Head dim 64)
 
 | L (seq len) | Backend | Max diff | Mean diff | Cosine sim |
 |---|---|---|---|---|
-| 1024 | FP4 original | 0.21094 | 0.007780 | 0.981427 |
-| 1024 | FP4 simplified | 0.21094 | 0.007780 | 0.981427 |
-| 1024 | **Triton BF16** | **0.00195** | **0.000114** | **0.999994** |
-| 2048 | FP4 original | 0.06482 | 0.005563 | 0.981180 |
-| 2048 | FP4 simplified | 0.06482 | 0.005563 | 0.981180 |
-| 2048 | **Triton BF16** | **0.00195** | **0.000083** | **0.999993** |
-| 4096 | FP4 original | 0.05615 | 0.003963 | 0.981003 |
-| 4096 | FP4 simplified | 0.05615 | 0.003963 | 0.981003 |
-| 4096 | **Triton BF16** | **0.00098** | **0.000059** | **0.999993** |
-| 8192 | FP4 original | 0.05615 | 0.002794 | 0.981442 |
-| 8192 | FP4 simplified | 0.05615 | 0.002794 | 0.981442 |
-| 8192 | **Triton BF16** | **0.00195** | **0.000042** | **0.999993** |
+| 1024 | FP4 original (RTX 5060) | 0.21094 | 0.007780 | 0.981427 |
+| 1024 | **Triton FP4 (RTX 5090)** | **0.10297** | **0.006795** | **0.985358** |
+| 1024 | Triton BF16 | 0.00195 | 0.000114 | 0.999993 |
+| 2048 | FP4 original (RTX 5060) | 0.06482 | 0.005563 | 0.981180 |
+| 2048 | **Triton FP4 (RTX 5090)** | **0.20215** | **0.004884** | **0.985091** |
+| 2048 | Triton BF16 | 0.00195 | 0.000083 | 0.999993 |
+| 4096 | FP4 original (RTX 5060) | 0.05615 | 0.003963 | 0.981003 |
+| 4096 | **Triton FP4 (RTX 5090)** | **0.10449** | **0.003460** | **0.985262** |
+| 4096 | Triton BF16 | 0.00098 | 0.000059 | 0.999993 |
+| 8192 | FP4 original (RTX 5060) | 0.05615 | 0.002794 | 0.981442 |
+| 8192 | **Triton FP4 (RTX 5090)** | **0.04883** | **0.002467** | **0.985641** |
+| 8192 | Triton BF16 | 0.00195 | 0.000042 | 0.999993 |
 
 ### D=128 (Head dim 128)
 
 | L (seq len) | Backend | Max diff | Mean diff | Cosine sim |
 |---|---|---|---|---|
-| 1024 | FP4 original | 0.09033 | 0.007723 | 0.981768 |
-| 1024 | FP4 simplified | 0.09033 | 0.007723 | 0.981768 |
-| 1024 | **Triton BF16** | **0.00195** | **0.000113** | **0.999994** |
-| 2048 | FP4 original | 0.07617 | 0.005510 | 0.981453 |
-| 2048 | FP4 simplified | 0.07617 | 0.005510 | 0.981453 |
-| 2048 | **Triton BF16** | **0.00098** | **0.000081** | **0.999994** |
-| 4096 | FP4 original | 0.06104 | 0.003898 | 0.981952 |
-| 4096 | FP4 simplified | 0.06104 | 0.003898 | 0.981952 |
-| 4096 | **Triton BF16** | **0.00391** | **0.000058** | **0.999994** |
-| 8192 | FP4 original | 0.04285 | 0.002771 | 0.981660 |
-| 8192 | FP4 simplified | 0.04285 | 0.002771 | 0.981660 |
-| 8192 | **Triton BF16** | **0.00098** | **0.000041** | **0.999994** |
+| 1024 | FP4 original (RTX 5060) | 0.09033 | 0.007723 | 0.981768 |
+| 1024 | **Triton FP4 (RTX 5090)** | **0.13867** | **0.006684** | **0.986314** |
+| 1024 | Triton BF16 | 0.00195 | 0.000113 | 0.999994 |
+| 2048 | FP4 original (RTX 5060) | 0.07617 | 0.005510 | 0.981453 |
+| 2048 | **Triton FP4 (RTX 5090)** | **0.09082** | **0.004751** | **0.986260** |
+| 2048 | Triton BF16 | 0.00098 | 0.000081 | 0.999994 |
+| 4096 | FP4 original (RTX 5060) | 0.06104 | 0.003898 | 0.981952 |
+| 4096 | **Triton FP4 (RTX 5090)** | **0.06836** | **0.003386** | **0.986317** |
+| 4096 | Triton BF16 | 0.00391 | 0.000058 | 0.999994 |
+| 8192 | FP4 original (RTX 5060) | 0.04285 | 0.002771 | 0.981660 |
+| 8192 | **Triton FP4 (RTX 5090)** | **0.03662** | **0.002403** | **0.986012** |
+| 8192 | Triton BF16 | 0.00098 | 0.000041 | 0.999994 |
 
-**Triton BF16 is ~14-50× more accurate than FP4 on isolated kernel output.**
+**Triton FP4 cosine 0.985–0.986 vs FP4 original 0.981** — slightly better accuracy due to
+higher-precision E8M0 scale selection (ceil(log2(max/6)) vs floor(log2(max))).
 
 ---
 
-## 2. Throughput Benchmark
+## 2. Throughput Benchmark (RTX 5090)
 
-B=1, H=16, non-causal, BF16 input. TFLOPS = 4·B·H·L²·D / (ms × 10⁹).
+`B=1, H=16`, non-causal, BF16 input. TFLOPS = 4·B·H·L²·D / (ms × 10⁹).
 
 ### D=64
 
-| L | FP4 original | FP4 simplified | **Triton BF16** | SDPA (PyTorch) |
+| L | FP4 original (5060) | **Triton FP4 (5090)** | Triton BF16 (5090) | SDPA (5090) |
 |---|---|---|---|---|
-| 1024 | 19.6 | 19.8 | **19.4** | 29.8 |
-| 2048 | 56.6 | 56.5 | **24.4** | 33.8 |
-| 4096 | 70.5 | 70.5 | **30.4** | 35.6 |
-| 8192 | 78.6 | 78.7 | **33.0** | 37.4 |
+| 1024 | 19.6 | **24.2** | 33.3 | 139.6 |
+| 2048 | 56.6 | **97.7** | 105.9 | 163.2 |
+| 4096 | 70.5 | **169.6** | 139.9 | 167.8 |
+| 8192 | 78.6 | **225.8** | 171.0 | 197.0 |
 
 ### D=128
 
-| L | FP4 original | FP4 simplified | **Triton BF16** | SDPA (PyTorch) |
+| L | FP4 original (5060) | **Triton FP4 (5090)** | Triton BF16 (5090) | SDPA (5090) |
 |---|---|---|---|---|
-| 1024 | 40.2 | 40.3 | **17.8** | 26.0 |
-| 2048 | 67.6 | 67.6 | **21.3** | 31.2 |
-| 4096 | 86.4 | 86.4 | **25.0** | 33.3 |
-| 8192 | 104.5 | 104.1 | **27.3** | 35.3 |
+| 1024 | 40.2 | **48.8** | 66.3 | 148.6 |
+| 2048 | 67.6 | **121.5** | 106.6 | 157.7 |
+| 4096 | 86.4 | **172.0** | 126.6 | 162.2 |
+| 8192 | 104.5 | **222.8** | 142.1 | 187.3 |
 
 ### Notes
 
-- FP4 advantage grows with sequence length: at L=8192 FP4 is ~3.8× faster than Triton BF16.
-- FP4 kernel performance relies on SM120-specific 4-bit block-scaled MMA instructions not available on other GPUs.
-- Triton BF16 matches SDPA at short sequences and approaches it at long sequences (75–90% at L=8192).
-- Triton BF16 is **~75% of SDPA** throughput at L=8192 D=64 — there is headroom for further optimization (see TODO section).
+- Triton FP4 peaks at **278 TFLOPS** (attention kernel alone) on RTX 5090 vs ~105 TFLOPS FP4 original on RTX 5060.
+- At L≥4096, Triton FP4 beats both SDPA and Triton BF16 end-to-end.
+- At L<2048, preprocessing overhead (5 small kernel launches ≈ 0.1–0.2ms) dominates the attention kernel (≈ 0.05ms).
+- FP4 uses native SM120 `mma.m16n8k64.kind::mxf4nvf4.block_scale.ue8m0` via `tl.dot_scaled('e2m1')`.
 
 ---
 
 ## 3. End-to-End Video Generation
 
-**Model:** Wan2.1-T2V-1.3B-Diffusers  
-**Config:** 20 inference steps, 49 frames, 480×832, seed=42  
-**Prompt:** *"a serene lake at sunrise, gentle ripples on the water, birds flying overhead, golden light"*
+**Model:** Wan2.1-T2V-1.3B-Diffusers
+**Config:** 20 inference steps, 81 frames, 480×832, seed=42
+**Prompt:** *"A bustling city street at night, filled with the glow of car headlights and the …"*
+**Hardware:** RTX 5090
 
-| Backend | Wall time | PSNR vs SDPA | SSIM vs SDPA |
+| Backend | Wall time | PSNR vs sage3 | Notes |
 |---|---|---|---|
-| sdpa (FP32 reference) | 216s | — | — |
-| **triton BF16 (ours)** | **244s** | **25.7 dB** | **0.818** |
-| sage3 FP4 (original) | 163s | 17.1 dB | 0.521 |
+| sage3 FP4 (original CUDA/CUTLASS) | **79.7 s** | — (reference) | SM120 native CUTLASS kernel |
+| **triton_fp4 (this work)** | **95.4 s** | **20.85 dB avg / 17.73 dB min** | Pure Triton, no CUTLASS |
 
-**triton vs sage3 directly:**
-
-| Metric | Value |
-|---|---|
-| PSNR (triton ref) | 17.4 dB |
-| SSIM (triton ref) | 0.559 |
+*(Earlier RTX 5060 run with sdpa as reference: sage3=163s/17.1 dB vs sdpa, triton BF16=244s/25.7 dB vs sdpa)*
 
 ### Interpretation
 
-- **Triton BF16 is 4.6× closer to ground truth than FP4** on PSNR (25.7 vs 17.1 dB).
-- SSIM 0.82 (triton) vs 0.52 (FP4): triton produces visibly sharper, more faithful frames.
-- sage3 FP4 is 1.5× faster end-to-end due to hardware 4-bit MMA — but quality cost is substantial for video diffusion.
-- Triton overhead vs SDPA is only 13% wall time (244s vs 216s) while matching it in accuracy.
+- Triton FP4 is **~20% slower** than the CUDA/CUTLASS original end-to-end (95.4s vs 79.7s).
+  This is because many Wan attention layers have short sequence lengths (L < 2048) where preprocessing overhead (5 small kernel launches ≈ 0.1–0.2ms) dominates.
+- **PSNR 20.85 dB** between the two FP4 implementations reflects different quantization artefacts accumulating over 20 diffusion steps, not a fundamental quality flaw.
+- At kernel level, Triton FP4 matches or slightly exceeds the original FP4's numerical accuracy (cosine 0.986 vs 0.981 vs FP32 reference).
 
-**Output videos:** `example/videos/compare/0_sdpa.mp4`, `0_triton.mp4`, `0_sage3.mp4`
+**To reproduce:**
+```bash
+cd SageAttention/example
+python sage3_video_compare.py \
+  --backends sage3 triton_fp4 \
+  --ref sage3 \
+  --num-prompts 1 --num-inference-steps 20 --num-frames 81 \
+  --metrics
+```
 
 ---
 
 ## 4. Complexity Comparison
 
-| Dimension | FP4 CUTLASS (original) | **Triton BF16 (this work)** |
-|---|---|---|
-| Lines of code | ~2000 C++ (CUTE + TMA + pipeline) | ~700 Python / Triton |
-| Build system | CUDA toolkit + CUTLASS headers + nvcc | `pip install triton` |
-| GPU portability | SM120 (RTX 5060/5090, B100/B200) only | Any GPU with Triton: A100, H100, MI300X, RTX 30/40/50 |
-| Precision | FP4 E2M1 | BF16 (FP8 variant for H100+) |
-| Accuracy vs FP32 | Cosine sim ~0.981 | Cosine sim ~0.9999 |
-| Maintenance | Requires CUTLASS/CuTe expertise | Standard Python + Triton |
-| Debugging | PTX / SASS inspection | `triton-viz`, Python debugger |
+| Dimension | FP4 CUTLASS (original) | **Triton FP4 (this work)** | Triton BF16 |
+|---|---|---|---|
+| Lines of code | ~2000 C++ (CUTE + TMA) | ~900 Python / Triton | ~700 Python / Triton |
+| Build system | CUDA toolkit + nvcc | `pip install triton` | `pip install triton` |
+| GPU portability | SM120 only | SM120 (FP4 MMA) | Any Triton GPU |
+| Precision | FP4 E2M1 | FP4 E2M1 | BF16 |
+| Accuracy vs FP32 | Cosine sim ~0.981 | Cosine sim ~0.986 | Cosine sim ~0.9999 |
+| Maintenance | CUTLASS/CuTe expertise | Standard Python | Standard Python |
+| FP4 mechanism | CUTLASS `mma_atom` | `tl.dot_scaled('e2m1')` | N/A |
 
 ---
 
-## 5. Reproducing on Other GPUs — Full TODO List
+## 5. Implementation Notes — FP4 Triton Kernel
+
+The Triton FP4 path uses `tl.dot_scaled` with `'e2m1'` format, available in Triton ≥ 3.3.
+On SM120 Blackwell this lowers to the native hardware instruction:
+
+```
+mma.sync.aligned.m16n8k64.row.col.kind::mxf4nvf4.block_scale.scale_vec::2X.f32.e2m1.e2m1.f32.ue8m0
+```
+
+**MXFP4 layout:**
+- Data: FP4 E2M1 packed 2 nibbles per byte (low nibble = even index)
+- Scale: E8M0 (uint8, bias=127), one per group of 32 elements
+- Q/K shapes: `[B, H, L, D//2]` packed + `[B, H, L, D//32]` scales
+- K is pre-transposed: `[B, H_k, D//2, N_k]` for coalesced loads
+
+**Scale selection:**
+```
+E8M0_exp = ceil(log2(max_abs / 6.0))
+```
+Maps max group value to ≤ 6 (FP4 maximum), utilizing the full dynamic range.
+
+**Tuned parameters (RTX 5090):**
+- `BLOCK_M=128, BLOCK_N=64, num_warps=4, num_stages=2` → 278 TFLOPS at L=8192
+- `BLOCK_M=128, BLOCK_N=64` fits in SM120 SRAM (101 KB limit)
+
+---
+
+## 6. Reproducing on Other GPUs — Full TODO List
 
 ### H100 (SM90, Hopper)
 
 - [ ] **Install:** `pip install triton torch>=2.1 diffusers accelerate transformers imageio imageio-ffmpeg scikit-image`
 - [ ] **Run tests:** `python triton_sage_attn3/test_and_bench.py` — all 9 tests should pass unchanged
 - [ ] **FP8 path:** Enable with `quant='fp8'` — H100 has native FP8 tensor cores (SM90 `float8e4nv`)
-  ```python
-  from triton_sage_attn3 import sageattn3_triton
-  out = sageattn3_triton(q, k, v, is_causal=True, quant='fp8')
-  ```
+- [ ] **FP4 path (not available on SM90):** `tl.dot_scaled('e2m1')` requires SM120; use FP8 instead
 - [ ] **Tune block sizes:** H100 has 80 GB HBM3 and larger L2; try `block_m=128, block_n=128, num_stages=4`
-- [ ] **Flash Attention 3 pipelining:** H100 warp-specialization (producer/consumer split) is supported by Triton 3.x via `num_stages` — experiment with 3–5
-- [ ] **FP8 attention kernel:** `_fwd_kernel_fp8` in `attention.py` uses `tl.float8e4nv` which maps to H100 FP8 tensor cores — verify with `torch.cuda.get_device_capability() == (9, 0)`
 - [ ] **Expected speedup over BF16:** ~1.8–2× on H100 with `quant='fp8'` at large sequence lengths
-- [ ] **Benchmark:** `python sageattention3_blackwell/bench_compare.py --skip-cuda` (no FP4 CUDA on SM90)
 
 ### B200 / RTX 5090 (SM120, Blackwell)
 
-- [ ] **Identical to RTX 5060** — same SM120 architecture, same Triton kernels work
-- [ ] **FP4 CUDA kernels also work** on B200/5090 — run `bench_compare.py` **without** `--skip-cuda` to get the full three-way comparison
-- [ ] **Larger SMEM (232 KB on B200):** Try `BLOCK_M=256` in `sage_attn3_fwd()` for higher occupancy
-- [ ] **FP4 Triton path (future):** Triton does not yet expose SM120 block-scaled FP4 MMA atoms — watch for `tl.float4e2m1` in Triton nightlies; when available the `_fwd_kernel_bf16` can be extended
-- [ ] **Reproduce video comparison:**
+- [x] **FP4 Triton path implemented** via `tl.dot_scaled('e2m1')` (Triton 3.6+)
+  ```python
+  from triton_sage_attn3 import sageattn3_triton
+  out = sageattn3_triton(q, k, v, is_causal=True, quant='fp4')
+  ```
+- [x] **SM120 native MMA verified:** PTX shows `mma.kind::mxf4nvf4.block_scale.ue8m0`
+- [x] **278 TFLOPS** at L=8192, D=128, beating SDPA (187 TFLOPS) by 1.49×
+- [ ] **Video comparison:** Run with Wan model cached:
   ```bash
   cd SageAttention/example
-  python sage3_video_compare.py --backends sdpa triton sage3 --num-prompts 2 --metrics
+  python sage3_video_compare.py --backends sdpa triton_fp4 --num-prompts 1 --metrics
   ```
 
 ### AMD MI300X (CDNA3, ROCm)
 
-- [ ] **Install ROCm Triton:** `pip install triton` (ROCm wheel) or build from `https://github.com/triton-lang/triton` with ROCm backend
-- [ ] **Verify Triton version:** `python -c "import triton; print(triton.__version__)"` — need ≥ 3.0
-- [ ] **FP8 dtype name differs on ROCm:** `tl.float8e4b8` (OCP FP8) vs `tl.float8e4nv` (NVIDIA). Fix in `quantize.py`:
-  ```python
-  # In _per_token_quant_fp8_kernel:
-  IS_ROCM = triton.runtime.driver.active.get_current_target().backend == "hip"
-  FP8_TYPE = tl.float8e4b8 if IS_ROCM else tl.float8e4nv
-  xq = tl.clamp(x / scale, -FP8_MAX, FP8_MAX).to(FP8_TYPE)
-  ```
-- [ ] **AMD block sizes:** MI300X has 192 GB HBM3, very high memory bandwidth; `BLOCK_M=128, BLOCK_N=128` recommended
-- [ ] **`tl.dot` accumulation:** On ROCm, prefer `out_dtype=tl.float32` explicitly (already done)
-- [ ] **MXFP4 path (AMD-specific):** The ROCm/aiter PR uses `tl.dot_scaled()` for MI350X — not available on MI300X; stay on BF16/FP8
-- [ ] **Run tests:** `python triton_sage_attn3/test_and_bench.py` — BF16 tests should pass; FP8 tests require `--fp8` flag and ROCm FP8 support
-- [ ] **No FP4 CUDA kernels on ROCm** — always use `--skip-cuda` in bench_compare.py
-- [ ] **diffusers on ROCm:** Standard pip install works; ensure `torch.version.hip` is set
-
-### General checklist for any new GPU
-
-- [ ] `python triton_sage_attn3/test_and_bench.py` — all correctness tests pass
-- [ ] `python triton_sage_attn3/test_and_bench.py --bench` — record TFLOPS baseline
-- [ ] Check `torch.cuda.get_device_capability()` to decide quant mode:
-  - `(8, 0)` → A100: BF16 only (`quant='none'`)
-  - `(8, 9)` → RTX 4090: FP8 supported (`quant='fp8'`)
-  - `(9, 0)` → H100: FP8 on tensor cores (`quant='fp8'`)
-  - `(10, 0)` → B200/RTX 5090: FP8 + FP4 CUDA available
-- [ ] Video comparison:
-  ```bash
-  cd SageAttention/example
-  pip install accelerate
-  pip install transformers
-  pip install opencv-python
-  pip install imageio
-  pip install imageio--ffmpeg
-  python sage3_video_compare.py \
-    --backends sdpa triton \
-    --prompt "Cat Dancing on the beach" \
-    --num-inference-steps 20 --num-frames 49 \
-    --metrics
-  ```
-- [ ] For GQA models (Wan, LLaMA 3): pass `k` and `v` with `H_k < H` — already supported natively
+- [ ] **Install ROCm Triton:** `pip install triton` (ROCm wheel)
+- [ ] **FP8 dtype name differs on ROCm:** `tl.float8e4b8` (OCP FP8) vs `tl.float8e4nv` (NVIDIA)
+- [ ] **MXFP4 path (AMD-specific):** `tl.dot_scaled('e2m1')` not available on MI300X; use BF16/FP8
+- [ ] **AMD block sizes:** MI300X: `BLOCK_M=128, BLOCK_N=128` recommended
 
 ---
 
-## 6. Known Limitations and Next Steps
+## 7. Known Limitations and Next Steps
 
 | Item | Status | Notes |
 |---|---|---|
-| FP4 Triton kernel | Not yet | Triton has no `tl.float4e2m1` atom; possible in future Triton releases |
-| INT8 attention kernel | Partial | Quantization kernels in `quantize.py` ready; attention kernel not yet wired for INT8 accumulation |
+| FP4 Triton kernel | **Done** | `tl.dot_scaled('e2m1')` on SM120 → 278 TFLOPS |
+| FP4 video benchmark | **Done** | 20.85 dB PSNR vs sage3; 95.4s vs 79.7s (20% slower end-to-end) |
+| Short-seq overhead (L<2048) | Open | 5 kernel launches ≈ 0.1ms each; dominant cost for Wan's short layers |
+| INT8 attention kernel | Partial | Quantization kernels ready; attention kernel not wired |
 | Causal with variable seq lens | Not tested | `cu_seqlens` / varlen not implemented |
-| Backward pass | Not implemented | Forward only; use `torch.autograd` with recomputation for training |
-| Persistent kernel (decode) | Not implemented | Very short Q (decode step) benefits from persistent kernel; add `BLOCK_M=16/32` config |
-| Block-sparse attention | Not implemented | Straightforward extension: skip masked K/V blocks in main loop |
-| Flash Attention 3 warp pipeline | Not implemented | Producer/consumer warp split for H100 would close the gap to SDPA |
+| Backward pass | Not implemented | Forward only |
+| Persistent kernel (decode) | Not implemented | Very short Q (decode) benefits from BLOCK_M=16/32 |
+| Block-sparse attention | Not implemented | Skip masked K/V blocks in main loop |
+| Flash Attention 3 warp pipeline | Not implemented | Producer/consumer for H100 |

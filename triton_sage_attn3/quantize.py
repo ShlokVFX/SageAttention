@@ -412,166 +412,151 @@ def _quant_mxfp4_kernel(
 
 
 # ---------------------------------------------------------------------------
-# Fused: smooth-quant Q centering + MXFP4 quantization in one kernel pass
+# Fused: smooth-quant centering + MXFP4 quantization for Q (one kernel pass)
 # ---------------------------------------------------------------------------
-# This fused kernel replaces two separate passes (smooth_quant_q + quant_fp4)
-# with a single memory-efficient pass over Q.
 #
-# For a group of GROUP_SIZE tokens [g*GROUP_SIZE : (g+1)*GROUP_SIZE]:
-#   1. Compute per-group mean qm[D]
-#   2. Subtract mean: q_c = q - qm   (smooth quant centering)
-#   3. For each subgroup of 32 elements within D:
-#      - E8M0 scale = 2^ceil(log2(max_abs/6))
-#      - Quantise q_c to FP4 E2M1 nibbles, pack 2 per byte
-# Also writes back qm for the delta_s computation.
+# One program per (b, h, g_token_group).  Each handles GROUP_SIZE tokens.
 #
-# Grid: (B * H * G,)  where G = L // GROUP_SIZE
+# Algorithm:
+#   Pass 1 — load Q tile [GROUP_SIZE, D], compute per-D-element mean (qm[D])
+#   Pass 2 — reload Q tile group-by-32-D-elements, subtract qm, quantize to
+#             FP4 E2M1 + E8M0 scale, pack 2 nibbles per byte.
+#
+# Note: Triton does not support 2D tensor indexing with mixed
+#       constexpr/vector indices (q_c[t, offs_e]).  We use pointer arithmetic
+#       throughout so all loads produce explicit [GROUP_SIZE, 16] 2D tensors.
+#
+# Grid: (B * H * G,)
 # ---------------------------------------------------------------------------
 
 @triton.jit
-def _smooth_quant_then_fp4_kernel(
-    q_ptr,     # [B, H, L, D]      input BF16/FP16
-    qm_ptr,    # [B, H, G, D]      output: per-group means (for delta_s)
-    p_ptr,     # [B, H, L, D//2]   output: packed FP4
-    s_ptr,     # [B, H, L, D//32]  output: E8M0 scales
-    # Strides for q [B, H, L, D]
-    stride_qb, stride_qh, stride_ql, stride_qd,
-    # Strides for qm [B, H, G, D]
-    stride_qmb, stride_qmh, stride_qmg, stride_qmd,
-    # Strides for p [B, H, L, D//2]
-    stride_pb, stride_ph, stride_pl,
-    # Strides for s [B, H, L, D//32]
-    stride_sb, stride_sh, stride_sl,
-    B, H,
-    D:          tl.constexpr,
-    GROUP_SIZE: tl.constexpr,   # tokens per smooth-quant group (= BLOCK_M = 128)
-):
-    """
-    Grid: (B * H * G,) where G = L // GROUP_SIZE.
-    Each program handles one [GROUP_SIZE, D] tile of Q.
-    """
-    LOG2_6: tl.constexpr = 2.5849625007211563
-
-    pid   = tl.program_id(0)
-    G     = tl.cdiv(tl.load(q_ptr).to(tl.int32) * 0 + 1, 1)  # unused, just for shape
-    # Decode (b, h, g) from pid
-    # We pass G implicitly via the grid size; decode b,h,g via division
-    # pid = b * (H * num_groups) + h * num_groups + g
-    # Since num_groups is runtime, we pass it as a constexpr via separate arg.
-    # Simpler: just use tl.program_id and pass num_groups as constexpr.
-    # But since GROUP_SIZE is constexpr and L is runtime, we can't easily derive G.
-    # Workaround: pass G as a separate scalar argument.
-    pass
-
-
-# Simpler approach: one program per (b, h, g) with G passed as a regular arg.
-@triton.jit
-def _smooth_quant_then_fp4_kernel(
-    q_ptr,
-    qm_ptr,
-    p_ptr,
-    s_ptr,
+def _fused_smooth_fp4_kernel(
+    q_ptr,       # [B, H, L, D]       BF16/FP16 input
+    qm_ptr,      # [B, H, G, D]       BF16/FP16 mean output (for delta_s)
+    p_ptr,       # [B, H, L, D//2]    uint8 packed FP4 output
+    s_ptr,       # [B, H, L, D//32]   uint8 E8M0 scale output
     stride_qb, stride_qh, stride_ql, stride_qd,
     stride_qmb, stride_qmh, stride_qmg, stride_qmd,
-    stride_pb, stride_ph, stride_pl,
-    stride_sb, stride_sh, stride_sl,
-    H,   # number of Q heads
-    G,   # number of groups per (b, h)  = L // GROUP_SIZE
+    stride_pb, stride_ph, stride_pl,     # stride_pl = D//2  (innermost = 1)
+    stride_sb, stride_sh, stride_sl,     # stride_sl = D//32 (innermost = 1)
+    H, G,
     D:          tl.constexpr,
     GROUP_SIZE: tl.constexpr,
 ):
     """
     Grid: (B * H * G,).
+
+    One pass over Q: for each 32-element D-group:
+      1. Load [GROUP_SIZE, 16] even and [GROUP_SIZE, 16] odd column tiles.
+      2. Compute per-column mean across GROUP_SIZE tokens → mean_e[16], mean_o[16].
+      3. Store mean to qm_ptr (interleaved back to D order).
+      4. Subtract mean, quantize to FP4 E2M1, pack, store.
+
+    Avoids the write-then-reload memory ordering hazard by never reloading
+    values computed within the same kernel invocation.
     """
     LOG2_6: tl.constexpr = 2.5849625007211563
 
-    pid      = tl.program_id(0)
-    b_idx    = pid // (H * G)
-    rem      = pid  % (H * G)
-    h_idx    = rem  //  G
-    g_idx    = rem   %  G
+    pid   = tl.program_id(0)
+    b_idx = pid // (H * G)
+    rem   = pid  % (H * G)
+    h_idx = rem  //  G
+    g_idx = rem   %  G
 
     t0     = g_idx * GROUP_SIZE
-    offs_t = t0 + tl.arange(0, GROUP_SIZE)  # token positions in (b, h) sequence
-    offs_d = tl.arange(0, D)
-
-    # ── Load Q tile [GROUP_SIZE, D] ───────────────────────────────────────────
-    q_base = b_idx * stride_qb + h_idx * stride_qh
-    q_ptrs = q_ptr + q_base \
-             + offs_t[:, None] * stride_ql \
-             + offs_d[None, :]  * stride_qd
-    q = tl.load(q_ptrs).to(tl.float32)   # [GROUP_SIZE, D]
-
-    # ── Smooth-quant: per-group mean over tokens ───────────────────────────────
-    qm = tl.sum(q, axis=0) / GROUP_SIZE  # [D]
-
-    # Store mean for delta_s computation
+    offs_t = t0 + tl.arange(0, GROUP_SIZE)   # [GROUP_SIZE] absolute token indices
+    q_base  = b_idx * stride_qb  + h_idx * stride_qh
     qm_base = b_idx * stride_qmb + h_idx * stride_qmh + g_idx * stride_qmg
-    tl.store(qm_ptr + qm_base + offs_d * stride_qmd,
-             qm.to(q_ptr.dtype.element_ty))
 
-    # ── Center Q ──────────────────────────────────────────────────────────────
-    q_c = q - qm[None, :]   # [GROUP_SIZE, D]
+    # ── Single pass: compute mean + center + quantize per 32-D-element group ───
+    for d_grp in tl.static_range(D // 32):
+        d0     = d_grp * 32
+        offs_e = d0 + tl.arange(0, 16) * 2        # [16] even  absolute D offsets
+        offs_o = d0 + tl.arange(0, 16) * 2 + 1    # [16] odd   absolute D offsets
 
-    # ── FP4 quantize each token in this group ─────────────────────────────────
-    # For each token t in the group: process D elements in groups of 32.
-    for t_local in tl.static_range(GROUP_SIZE):
-        t_global = t0 + t_local
-        for g_d in tl.static_range(D // 32):
-            base_d = g_d * 32
-            # Even/odd split for 32-element group
-            offs_e = base_d + tl.arange(0, 16) * 2
-            offs_o = base_d + tl.arange(0, 16) * 2 + 1
+        # Load [GROUP_SIZE, 16] tiles via 2D pointer arithmetic (no 2D indexing)
+        xe_raw = tl.load(
+            q_ptr + q_base
+            + offs_t[:, None] * stride_ql
+            + offs_e[None, :] * stride_qd
+        ).to(tl.float32)   # [GROUP_SIZE, 16]
 
-            xe = q_c[t_local, offs_e]   # [16]
-            xo = q_c[t_local, offs_o]   # [16]
+        xo_raw = tl.load(
+            q_ptr + q_base
+            + offs_t[:, None] * stride_ql
+            + offs_o[None, :] * stride_qd
+        ).to(tl.float32)   # [GROUP_SIZE, 16]
 
-            # E8M0 scale
-            max_abs   = tl.maximum(tl.max(tl.abs(xe)), tl.max(tl.abs(xo)))
-            log2_m    = tl.log2(tl.maximum(max_abs, 1e-30))
-            exp_raw   = -tl.floor(LOG2_6 - log2_m)
-            exp_clamp = tl.clamp(exp_raw, -127.0, 127.0)
-            scale     = tl.exp2(exp_clamp)
-            exp_biased = (exp_clamp + 127.0).to(tl.uint8)
+        # Mean across tokens for this 32-element D-subgroup
+        mean_e = tl.sum(xe_raw, axis=0) * (1.0 / GROUP_SIZE)   # [16]
+        mean_o = tl.sum(xo_raw, axis=0) * (1.0 / GROUP_SIZE)   # [16]
 
-            # Store scale
-            s_addr = s_ptr \
-                     + b_idx * stride_sb + h_idx * stride_sh \
-                     + t_global * stride_sl + g_d
-            tl.store(s_addr, exp_biased)
+        # Store mean (scatter to correct D positions in qm)
+        tl.store(qm_ptr + qm_base + offs_e * stride_qmd,
+                 mean_e.to(q_ptr.dtype.element_ty))
+        tl.store(qm_ptr + qm_base + offs_o * stride_qmd,
+                 mean_o.to(q_ptr.dtype.element_ty))
 
-            # Quantize
-            xe_n = xe / scale
-            xo_n = xo / scale
+        # Center
+        xe = xe_raw - mean_e[None, :]   # [GROUP_SIZE, 16]
+        xo = xo_raw - mean_o[None, :]
 
-            sign_e = tl.where(xe_n < 0.0, 8, 0)
-            ax_e   = tl.abs(xe_n)
-            mag_e  = tl.where(ax_e < 0.25, 0,
-                     tl.where(ax_e < 0.75, 1,
-                     tl.where(ax_e < 1.25, 2,
-                     tl.where(ax_e < 1.75, 3,
-                     tl.where(ax_e < 2.5,  4,
-                     tl.where(ax_e < 3.5,  5,
-                     tl.where(ax_e < 5.0,  6, 7)))))))
-            lo = ((sign_e | mag_e) & 0xF).to(tl.uint8)
+        # ── E8M0 scale per token (row-wise max over 32 elements) ──────────────
+        max_abs   = tl.maximum(
+            tl.max(tl.abs(xe), axis=1),
+            tl.max(tl.abs(xo), axis=1),
+        )   # [GROUP_SIZE]
+        log2_m    = tl.log2(tl.maximum(max_abs, 1e-30))
+        exp_raw   = -tl.floor(LOG2_6 - log2_m)          # ceil(log2(max/6))
+        exp_clamp = tl.clamp(exp_raw, -127.0, 127.0)
+        scale     = tl.exp2(exp_clamp)                   # [GROUP_SIZE]
+        exp_biased = (exp_clamp + 127.0).to(tl.uint8)    # [GROUP_SIZE]
 
-            sign_o = tl.where(xo_n < 0.0, 8, 0)
-            ax_o   = tl.abs(xo_n)
-            mag_o  = tl.where(ax_o < 0.25, 0,
-                     tl.where(ax_o < 0.75, 1,
-                     tl.where(ax_o < 1.25, 2,
-                     tl.where(ax_o < 1.75, 3,
-                     tl.where(ax_o < 2.5,  4,
-                     tl.where(ax_o < 3.5,  5,
-                     tl.where(ax_o < 5.0,  6, 7)))))))
-            hi = (((sign_o | mag_o) & 0xF) << 4).to(tl.uint8)
-            packed = (lo | hi).to(tl.uint8)
+        # Store one scale per token per D-group
+        tl.store(
+            s_ptr + b_idx * stride_sb + h_idx * stride_sh
+            + offs_t * stride_sl + d_grp,
+            exp_biased,
+        )
 
-            # Store packed bytes
-            p_addr = p_ptr \
-                     + b_idx * stride_pb + h_idx * stride_ph \
-                     + t_global * stride_pl + g_d * 16
-            tl.store(p_addr + tl.arange(0, 16), packed)
+        # ── Normalize ─────────────────────────────────────────────────────────
+        xe_n = xe / scale[:, None]   # [GROUP_SIZE, 16]
+        xo_n = xo / scale[:, None]
+
+        # ── Quantize to FP4 E2M1 nibbles ──────────────────────────────────────
+        sign_e = tl.where(xe_n < 0.0, 8, 0)
+        ax_e   = tl.abs(xe_n)
+        mag_e  = tl.where(ax_e < 0.25, 0,
+                 tl.where(ax_e < 0.75, 1,
+                 tl.where(ax_e < 1.25, 2,
+                 tl.where(ax_e < 1.75, 3,
+                 tl.where(ax_e < 2.5,  4,
+                 tl.where(ax_e < 3.5,  5,
+                 tl.where(ax_e < 5.0,  6, 7)))))))
+
+        sign_o = tl.where(xo_n < 0.0, 8, 0)
+        ax_o   = tl.abs(xo_n)
+        mag_o  = tl.where(ax_o < 0.25, 0,
+                 tl.where(ax_o < 0.75, 1,
+                 tl.where(ax_o < 1.25, 2,
+                 tl.where(ax_o < 1.75, 3,
+                 tl.where(ax_o < 2.5,  4,
+                 tl.where(ax_o < 3.5,  5,
+                 tl.where(ax_o < 5.0,  6, 7)))))))
+
+        lo     = ((sign_e | mag_e) & 0xF).to(tl.uint8)            # [GROUP_SIZE, 16]
+        hi     = (((sign_o | mag_o) & 0xF) << 4).to(tl.uint8)
+        packed = (lo | hi).to(tl.uint8)                            # [GROUP_SIZE, 16]
+
+        # ── Store 16 packed bytes per token per D-group ───────────────────────
+        # p layout: [B, H, L, D//2];  innermost stride = 1
+        offs_p = d_grp * 16 + tl.arange(0, 16)   # [16]
+        tl.store(
+            p_ptr + b_idx * stride_pb + h_idx * stride_ph
+            + offs_t[:, None] * stride_pl
+            + offs_p[None, :],
+            packed,
+        )
 
 
 def smooth_quant_and_fp4(
@@ -581,20 +566,22 @@ def smooth_quant_and_fp4(
     """
     Fused smooth-quant centering + MXFP4 quantization for Q.
 
-    Single kernel pass: load Q once, compute group mean, center, quantize.
+    Replaces the sequence: smooth_quant_q → quant_mxfp4_per_token
+    with a single kernel invocation, halving the number of kernel launches
+    and keeping Q data in L1/L2 between the mean and quantize passes.
 
     Args:
-        q:          [B, H, L, D]  BF16/FP16, L must be divisible by group_size.
-        group_size: smooth-quant group size (default 128 = BLOCK_M).
+        q:          [B, H, L, D]  BF16/FP16, L divisible by group_size.
+        group_size: smooth-quant group size (= BLOCK_M = 128).
 
     Returns:
         q_packed: [B, H, L, D//2]  uint8 packed FP4
         q_scales: [B, H, L, D//32] uint8 E8M0 scales
-        qm:       [B, H, G, D]     same dtype as q (for delta_s)
+        qm:       [B, H, G, D]     BF16/FP16 per-group mean (for delta_s)
     """
     B, H, L, D = q.shape
-    assert L % group_size == 0
-    assert D % 32 == 0
+    assert L % group_size == 0, f"L={L} not divisible by group_size={group_size}"
+    assert D % 32 == 0, f"D={D} not divisible by 32"
 
     G = L // group_size
 
@@ -602,8 +589,7 @@ def smooth_quant_and_fp4(
     q_scales = torch.empty(B, H, L, D // 32, dtype=torch.uint8, device=q.device)
     qm       = torch.empty(B, H, G, D,       dtype=q.dtype,    device=q.device)
 
-    grid = (B * H * G,)
-    _smooth_quant_then_fp4_kernel[grid](
+    _fused_smooth_fp4_kernel[(B * H * G,)](
         q, qm, q_packed, q_scales,
         q.stride(0),        q.stride(1),        q.stride(2),        q.stride(3),
         qm.stride(0),       qm.stride(1),       qm.stride(2),       qm.stride(3),

@@ -157,14 +157,21 @@ def compute_delta_s(
                           ≈ Q[i] @ K[j]
 
     Args:
-        qm: [B, H, G, D]    per-group means from smooth_quant_q.
-        k:  [B, H, N_k, D]  key tensor (already padded and normalized).
+        qm: [B, H,   G, D]   per-group means from smooth_quant_q.
+        k:  [B, H_k, N_k, D] key tensor (already padded and normalized).
+                              H_k may be < H (GQA).
 
     Returns:
         delta_s: [B, H, G, N_k]  float32 correction, one row per Q group.
     """
-    # Cast to float32 for the correction term so we don't lose precision.
-    return torch.matmul(qm.float(), k.float().transpose(-2, -1))
+    H   = qm.shape[1]
+    H_k = k.shape[1]
+    k_f = k.float()
+    if H_k < H:
+        # GQA: repeat K heads so H_k -> H for the broadcast matmul
+        repeat = H // H_k
+        k_f = k_f.repeat_interleave(repeat, dim=1)   # [B, H, N_k, D]
+    return torch.matmul(qm.float(), k_f.transpose(-2, -1))
 
 
 # ---------------------------------------------------------------------------

@@ -46,7 +46,8 @@ from diffusers.utils import export_to_video
 # ── Path setup ────────────────────────────────────────────────────────────────
 _HERE    = os.path.dirname(os.path.abspath(__file__))
 _SA_ROOT = os.path.dirname(_HERE)
-sys.path.insert(0, _SA_ROOT)   # for triton_sage_attn3
+sys.path.insert(0, _SA_ROOT)                                      # triton_sage_attn3
+sys.path.insert(0, os.path.join(_SA_ROOT, "sageattention3_blackwell"))  # fp4attn_cuda
 
 from modify_model.modify_wan import set_sage_attn_wan, SageWanAttnProcessor
 from triton_sage_attn3.api import sageattn3_triton
@@ -55,14 +56,21 @@ from triton_sage_attn3.api import sageattn3_triton
 # ── Attention backend registry ────────────────────────────────────────────────
 
 def _make_triton_fn():
-    """Wrap sageattn3_triton to match the (q,k,v,**kw) signature Wan expects."""
+    """Wrap sageattn3_triton (BF16) to match the (q,k,v,**kw) signature Wan expects."""
     def _triton(q, k, v, attn_mask=None, dropout_p=0.0, is_causal=False, **_):
-        return sageattn3_triton(q, k, v, is_causal=is_causal)
+        return sageattn3_triton(q, k, v, is_causal=is_causal, quant='none')
     return _triton
 
 
+def _make_triton_fp4_fn():
+    """Wrap sageattn3_triton (FP4 MXFP4) – uses native SM120 FP4 MMA instructions."""
+    def _triton_fp4(q, k, v, attn_mask=None, dropout_p=0.0, is_causal=False, **_):
+        return sageattn3_triton(q, k, v, is_causal=is_causal, quant='fp4')
+    return _triton_fp4
+
+
 def _make_sage3_fn():
-    """Import and wrap the original FP4 sageattn3 kernel."""
+    """Import and wrap the original FP4 sageattn3 (CUDA/CUTLASS) kernel."""
     try:
         from sageattn3 import sageattn3_blackwell
         def _sage3(q, k, v, attn_mask=None, dropout_p=0.0, is_causal=False, **_):
@@ -71,8 +79,8 @@ def _make_sage3_fn():
     except ImportError as e:
         raise ImportError(
             f"Could not import sageattn3 (FP4 CUDA kernel): {e}\n"
-            "Make sure you installed sageattn3 from "
-            "SageAttention/sageattention3_blackwell/ and are on SM120."
+            f"Build it first:\n"
+            f"  cd {_SA_ROOT}/sageattention3_blackwell && python setup.py build_ext --inplace"
         )
 
 
@@ -88,9 +96,10 @@ def _make_sdpa_fn():
 
 
 BACKEND_FACTORIES = {
-    "sdpa":   _make_sdpa_fn,
-    "triton": _make_triton_fn,
-    "sage3":  _make_sage3_fn,
+    "sdpa":        _make_sdpa_fn,
+    "triton":      _make_triton_fn,
+    "triton_fp4":  _make_triton_fp4_fn,
+    "sage3":       _make_sage3_fn,
 }
 
 
@@ -129,7 +138,8 @@ def _ssim(a, b):
         return None
 
 
-def compute_video_metrics(ref_path: str, cmp_path: str, label: str):
+def compute_video_metrics(ref_path: str, cmp_path: str, label: str,
+                          ref_label: str = "ref"):
     """Print PSNR / SSIM between two video files."""
     import numpy as np
     ref_frames = _load_video_frames(ref_path)
@@ -149,7 +159,7 @@ def compute_video_metrics(ref_path: str, cmp_path: str, label: str):
             ssims.append(s)
         maxdiffs.append(np.abs(r.astype(float) - c.astype(float)).max())
 
-    print(f"\n  Metrics  ref=sdpa  cmp={label}  ({n} frames)")
+    print(f"\n  Metrics  ref={ref_label}  cmp={label}  ({n} frames)")
     print(f"    PSNR    avg={np.mean(psnrs):.2f} dB  min={np.min(psnrs):.2f} dB")
     if ssims:
         print(f"    SSIM    avg={np.mean(ssims):.4f}     min={np.min(ssims):.4f}")
@@ -209,9 +219,14 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument(
         "--backends", nargs="+",
-        choices=["sdpa", "triton", "sage3"],
-        default=["sdpa", "triton"],
-        help="Which attention backends to run (default: sdpa triton)",
+        choices=["sdpa", "triton", "triton_fp4", "sage3"],
+        default=["sage3", "triton_fp4"],
+        help="Which attention backends to run (default: sage3 triton_fp4)",
+    )
+    p.add_argument(
+        "--ref", default=None,
+        choices=["sdpa", "triton", "triton_fp4", "sage3"],
+        help="Reference backend for metrics (default: first listed backend)",
     )
     p.add_argument(
         "--num-prompts", type=int, default=1,
@@ -295,20 +310,33 @@ def main():
                 import traceback; traceback.print_exc()
 
     # ── Metrics ───────────────────────────────────────────────────────────────
-    if args.metrics and "sdpa" in backend_fns:
-        print(f"\n{'='*60}")
-        print("PIXEL METRICS  (reference = sdpa)")
-        print(f"{'='*60}")
-        for pid in range(len(prompts)):
-            ref_path = results.get((pid, "sdpa"))
-            if ref_path is None:
-                continue
+    if args.metrics:
+        # Determine reference backend: explicit --ref, else first successfully-run backend
+        ref_backend = args.ref
+        if ref_backend is None:
             for name in args.backends:
-                if name == "sdpa":
+                if any((pid, name) in results for pid in range(len(prompts))):
+                    ref_backend = name
+                    break
+
+        if ref_backend and ref_backend in backend_fns:
+            print(f"\n{'='*60}")
+            print(f"PIXEL METRICS  (reference = {ref_backend})")
+            print(f"{'='*60}")
+            for pid in range(len(prompts)):
+                ref_path = results.get((pid, ref_backend))
+                if ref_path is None:
                     continue
-                cmp_path = results.get((pid, name))
-                if cmp_path:
-                    compute_video_metrics(ref_path, cmp_path, f"{name}[prompt{pid}]")
+                for name in args.backends:
+                    if name == ref_backend:
+                        continue
+                    cmp_path = results.get((pid, name))
+                    if cmp_path:
+                        compute_video_metrics(ref_path, cmp_path,
+                                              f"{name}[prompt{pid}]",
+                                              ref_label=ref_backend)
+        else:
+            print("\n[warn] --metrics requested but no reference backend available.")
 
     # ── Summary ───────────────────────────────────────────────────────────────
     print(f"\n{'='*60}")

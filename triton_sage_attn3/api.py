@@ -61,9 +61,9 @@ from typing import Literal, Optional
 
 import torch
 
-from .preprocessing import preprocess_qkv
+from .preprocessing import preprocess_qkv, normalize_k, compute_delta_s
 from .attention import sage_attn3_fwd, sage_attn3_fwd_fp8, sage_attn3_fwd_fp4
-from .quantize import quantise_qkv_fp8, quantise_qkv_fp4
+from .quantize import quantise_qkv_fp8, quantise_qkv_fp4, quant_mxfp4_per_token, smooth_quant_and_fp4
 
 
 # ---------------------------------------------------------------------------
@@ -114,55 +114,68 @@ def sageattn3_triton(
             "attn_mask is not yet supported. Use is_causal=True for causal masking."
         )
 
-    orig_L = q.size(2)      # unpadded query sequence length
-    orig_Lk = k.size(2)     # unpadded key sequence length
-    D      = q.size(-1)
+    import torch.nn.functional as F
+
+    orig_L  = q.size(2)
+    D       = q.size(-1)
 
     if sm_scale is None:
         sm_scale = D ** -0.5
 
-    # ── Preprocessing: smooth quant + K normalisation + delta_s ──────────────
-    q_pre, k_pre, v_pre, delta_s = preprocess_qkv(
-        q, k, v,
-        per_block_mean=per_block_mean,
-        group_size=group_size,
-    )
-    # After padding, the padded length may differ from orig_L
-    L_pad = q_pre.size(2)
+    # ── Padding to a multiple of group_size ──────────────────────────────────
+    pad = (group_size - orig_L % group_size) % group_size
+    if pad:
+        q = F.pad(q, (0, 0, 0, pad)).contiguous()
+        k = F.pad(k, (0, 0, 0, pad)).contiguous()
+        v = F.pad(v, (0, 0, 0, pad)).contiguous()
+    else:
+        q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
 
     # ── Route to the right kernel ─────────────────────────────────────────────
-    if quant == "none":
-        out_pad = sage_attn3_fwd(
-            q_pre, k_pre, v_pre,
-            delta_s=delta_s,
-            softmax_scale=sm_scale,
-            is_causal=is_causal,
+    if quant == "none" or quant == "fp8":
+        # These paths need the centred Q, normalised K, and delta_s from the
+        # standard preprocessing pipeline (smooth_quant_q, normalize_k, etc.)
+        q_pre, k_pre, v_pre, delta_s = preprocess_qkv(
+            q, k, v,
             per_block_mean=per_block_mean,
-            block_m=block_m,
-            block_n=block_n,
+            group_size=group_size,
         )
-
-    elif quant == "fp8":
-        q_fp8, k_fp8, v_fp8, q_scale, k_scale = quantise_qkv_fp8(
-            q_pre, k_pre, v_pre
-        )
-        out_pad = sage_attn3_fwd_fp8(
-            q_fp8, k_fp8, v_fp8,
-            q_scale, k_scale,
-            delta_s=delta_s,
-            softmax_scale=sm_scale,
-            is_causal=is_causal,
-            per_block_mean=per_block_mean,
-            block_m=block_m,
-            block_n=block_n,
-        )
+        if quant == "none":
+            out_pad = sage_attn3_fwd(
+                q_pre, k_pre, v_pre,
+                delta_s=delta_s,
+                softmax_scale=sm_scale,
+                is_causal=is_causal,
+                per_block_mean=per_block_mean,
+                block_m=block_m,
+                block_n=block_n,
+            )
+        else:  # fp8
+            q_fp8, k_fp8, v_fp8, q_scale, k_scale = quantise_qkv_fp8(
+                q_pre, k_pre, v_pre
+            )
+            out_pad = sage_attn3_fwd_fp8(
+                q_fp8, k_fp8, v_fp8,
+                q_scale, k_scale,
+                delta_s=delta_s,
+                softmax_scale=sm_scale,
+                is_causal=is_causal,
+                per_block_mean=per_block_mean,
+                block_m=block_m,
+                block_n=block_n,
+            )
 
     elif quant == "fp4":
-        q_packed, k_T_packed, v_fp4, q_scales, k_scales = quantise_qkv_fp4(
-            q_pre, k_pre, v_pre
-        )
+        # Optimised FP4 path — bypasses preprocess_qkv to avoid double-centering.
+        # The fused kernel does smooth-quant centering + FP4 quantization in one
+        # kernel invocation.  K is normalised and quantised separately.
+        k_norm                   = normalize_k(k)
+        q_packed, q_scales, qm   = smooth_quant_and_fp4(q, group_size=group_size)
+        delta_s                  = compute_delta_s(qm, k_norm)
+        k_packed, k_scales       = quant_mxfp4_per_token(k_norm)
+        k_T_packed               = k_packed.transpose(-2, -1).contiguous()
         out_pad = sage_attn3_fwd_fp4(
-            q_packed, k_T_packed, v_fp4,
+            q_packed, k_T_packed, v,
             q_scales, k_scales,
             delta_s=delta_s,
             softmax_scale=sm_scale,
